@@ -51,16 +51,16 @@ Keeps your branch up to date with everyone else's merged work.
 
 ## Collaborator breakdown
 
-| # | Collaborator | Owns | Key files |
-|---|---|---|---|
-| 1 | Landing Page & UI Shell | Home page, hero, nav, "Start Designing" CTA | `src/routes/+page.svelte`, shared UI in `src/lib/components/` |
-| 2 | 3D Scene Core | Three.js scene/camera/renderer/lighting setup, render loop, resize handling | `src/routes/studio/+page.svelte`, `src/lib/three/scene.js`, `src/lib/stores/scene-store.js` |
-| 3 | Model Library & Loading | GLTFLoader, categorisation (tables/seating/decor), model sidebar UI | `src/lib/three/model-loader.js`, `src/lib/components/ModelSidebar.svelte`, `static/models/` |
-| 4 | Selection & Transform Controls | Click-to-select (raycasting), move/rotate/scale, duplicate/delete with disposal | `src/lib/three/transform-controls.js` |
-| 5 | Colour Customisation | Per-instance material cloning, preset swatches, custom colour picker | `src/lib/three/colour-customisation.js`, `src/lib/components/ColourPanel.svelte` |
-| 6 | Camera Controls & Fullscreen | OrbitControls (orbit/zoom/pan), fullscreen toggle | `src/lib/three/camera-controls.js` |
-| 7 | Save/Load & Presets | Scene serialisation to localStorage, presets panel loading full interactive scenes | `src/lib/three/scene-storage.js`, `src/lib/components/PresetsPanel.svelte` |
-| 8 | Auth, Testing & Deployment | Sign up/login/logout, gating `/studio`, cross-feature testing pass, deployment | `src/routes/login/+page.svelte` |
+| #   | Collaborator                   | Owns                                                                               | Key files                                                                                   |
+| --- | ------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| 1   | Landing Page & UI Shell        | Home page, hero, nav, "Start Designing" CTA                                        | `src/routes/+page.svelte`, shared UI in `src/lib/components/`                               |
+| 2   | 3D Scene Core                  | Three.js scene/camera/renderer/lighting setup, render loop, resize handling        | `src/routes/studio/+page.svelte`, `src/lib/three/scene.js`, `src/lib/stores/scene-store.js` |
+| 3   | Model Library & Loading        | GLTFLoader, categorisation (tables/seating/decor), model sidebar UI                | `src/lib/three/model-loader.js`, `src/lib/components/ModelSidebar.svelte`, `static/models/` |
+| 4   | Selection & Transform Controls | Click-to-select (raycasting), move/rotate/scale, duplicate/delete with disposal    | `src/lib/three/transform-controls.js`                                                       |
+| 5   | Colour Customisation           | Per-instance material cloning, preset swatches, custom colour picker               | `src/lib/three/colour-customisation.js`, `src/lib/components/ColourPanel.svelte`            |
+| 6   | Camera Controls & Fullscreen   | OrbitControls (orbit/zoom/pan), fullscreen toggle                                  | `src/lib/three/camera-controls.js`                                                          |
+| 7   | Save/Load & Presets            | Scene serialisation to localStorage, presets panel loading full interactive scenes | `src/lib/three/scene-storage.js`, `src/lib/components/PresetsPanel.svelte`                  |
+| 8   | Auth, Testing & Deployment     | Sign up/login/logout, gating `/studio`, cross-feature testing pass, deployment     | `src/routes/login/+page.svelte`                                                             |
 
 Every file that's "yours" above has a `TODO (Collaborator N)` comment block
 at the top explaining exactly what goes there and which other files it
@@ -114,3 +114,4 @@ decohub/
   Collaborator 3 first.
 - Run `npm run dev` before every push to make sure you haven't broken the
   build for everyone else.
+  everyone must update their various repos
