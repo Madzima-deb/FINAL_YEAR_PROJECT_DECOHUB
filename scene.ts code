@@ -1,0 +1,1192 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { DEFAULT_HEIGHT, GLASS_TABLE_WIDTH, isRoundTable, isTable, CHAIR_DEFAULT_HEIGHT, CHAIR_DEFAULT_WIDTH, isScaledChair, isReferenceChair } from './models';
+
+export class SceneManager {
+    private scene: THREE.Scene;
+    private camera: THREE.PerspectiveCamera;
+    private renderer: THREE.WebGLRenderer;
+    private controls: OrbitControls;
+    private transformControl: TransformControls;
+    /**
+     * The Object3D helper returned by transformControl.getHelper().
+     * Three.js r169+ breaking change: TransformControls is no longer an Object3D,
+     * so we must add getHelper() to the scene instead of the controls instance.
+     */
+    private transformControlHelper: THREE.Object3D;
+    private loader: GLTFLoader;
+    private animationId: number = 0;
+    /** Guards against duplicate destroy() calls (e.g. Vite HMR re-mount) */
+    private destroyed = false;
+
+    private raycaster: THREE.Raycaster;
+    private mouse: THREE.Vector2;
+    private clickStart = new THREE.Vector2();
+
+    private loadedModels: Map<string, THREE.Object3D> = new Map();
+    private originalMaterials: Map<string, Map<THREE.Mesh, THREE.Material>> = new Map();
+    /**
+     * Cached XZ footprint (max of bounding-box width & depth) for each model ID,
+     * measured at the post-normalised scale.
+     * Computed once on first load; duplicates read from cache.
+     */
+    private modelFootprints: Map<string, number> = new Map();
+    /** Per-model load error messages, exposed so the UI can display them. */
+    public loadErrors: Map<string, string> = new Map();
+
+    // ── DEFAULT_HEIGHT Y-lock ────────────────────────────────────────────────
+    // Every model loaded into the scene has its Y-scale adjusted so its
+    // bounding-box height equals DEFAULT_HEIGHT (imported from models.ts).
+    // X and Z are left at 1 (natural GLB proportions) and may be further
+    // multiplied by initialScale for surface-relative fitting.
+    // The locked Y value is stored in userData.defaultHeightScale so it can
+    // be re-enforced after user scale drags and design restores.
+
+    public onObjectSelected?: (id: string | null) => void;
+    public onTransformChange?: (id: string, position: THREE.Vector3, rotation: THREE.Euler, scale: THREE.Vector3) => void;
+    
+    private selectedObjectId: string | null = null;
+
+    private currentEnvTexture: THREE.Texture | null = null;
+    private defaultBackground: THREE.Color = new THREE.Color('#e0e0e5');
+
+    // ── Floor / Grid references — stored so we can show/hide them ───────────
+    private floorMesh!: THREE.Mesh;
+    private gridHelper!: THREE.GridHelper;
+
+    // ── Background system ────────────────────────────────────────────────────
+    /**
+     * ARCHITECTURE — Why we no longer use scene.background:
+     * ───────────────────────────────────────────────────────────────────────
+     * scene.background maps a texture onto a skybox sphere and samples it based
+     * on the PerspectiveCamera viewing direction. Because the camera is tilted
+     * downward (position (0,3,6) looking at target (0,1,0)), the image only
+     * appears in the upper viewport half; the lower half shows the 3D floor.
+     *
+     * Fix: dual-render architecture each frame:
+     *   1. bgScene rendered first with bgCamera (OrthographicCamera) → draws
+     *      a fullscreen PlaneGeometry quad textured with the JPEG.
+     *   2. Main 3D scene rendered on top with autoClear = false → models and
+     *      gizmos composite over the already-painted background.
+     *
+     * Benefits:
+     *   • Background is 100% immune to PerspectiveCamera tilt / orbit / position.
+     *   • Cover/contain UV scaling is trivial 2D screen-space math.
+     *   • bgMesh lives in bgScene, NOT the main scene → raycasting against
+     *     loadedModels can never accidentally hit the background quad.
+     *   • captureScene() renders both passes → screenshot is the correct composite.
+     */
+    private bgScene: THREE.Scene;
+    private bgCamera: THREE.OrthographicCamera;
+    private bgMesh: THREE.Mesh | null = null;
+    private bgTexture: THREE.Texture | null = null;
+    private bgMode: 'contain' | 'cover' | 'stretch' | 'original' = 'cover';
+    private imageAspect: number = 1;
+    /** True while an environment image is active (drives two-pass render path). */
+    private hasEnvImage = false;
+
+    constructor(canvas: HTMLCanvasElement) {
+        // ── Scene ──────────────────────────────────────────────────────
+        this.scene = new THREE.Scene();
+        this.scene.background = this.defaultBackground;
+
+        // ── Background scene (orthographic fullscreen quad) ────────────
+        // OrthographicCamera(-1, 1, 1, -1, 0, 1) maps UV [0..1] exactly to the
+        // viewport. The PlaneGeometry(2, 2) fills that [-1..1] NDC range precisely.
+        this.bgScene  = new THREE.Scene();
+        this.bgCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+        // ── Renderer ───────────────────────────────────────────────────
+        // preserveDrawingBuffer is required so we can call toDataURL() for scene capture
+        this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+
+        const width  = canvas.parentElement?.clientWidth  || window.innerWidth;
+        const height = canvas.parentElement?.clientHeight || window.innerHeight;
+
+        this.camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+        this.camera.position.set(0, 3, 6);
+
+        this.renderer.setSize(width, height);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 1.0;
+
+        // ── Orbit controls ─────────────────────────────────────────────
+        this.controls = new OrbitControls(this.camera, canvas);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.05;
+        this.controls.target.set(0, 1, 0);
+
+        // ── TransformControls (r169+ API) ──────────────────────────────
+        // TransformControls no longer extends Object3D. We must call
+        // getHelper() to obtain the Object3D gizmo, then add that to the scene.
+        this.transformControl = new TransformControls(this.camera, canvas);
+        this.transformControl.addEventListener('dragging-changed', (event) => {
+            // Disable orbit while dragging a transform handle
+            this.controls.enabled = !(event as any).value;
+        });
+        this.transformControl.addEventListener('change', () => {
+            if (this.selectedObjectId && this.onTransformChange) {
+                const model = this.loadedModels.get(this.selectedObjectId);
+                if (model) {
+                    this.onTransformChange(this.selectedObjectId, model.position, model.rotation, model.scale);
+                }
+            }
+        });
+        this.transformControlHelper = this.transformControl.getHelper();
+        this.scene.add(this.transformControlHelper);
+
+        // ── Raycaster ──────────────────────────────────────────────────
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+
+        this.loader = new GLTFLoader();
+
+        this.setupLights();
+        this.setupFloor();
+
+        window.addEventListener('resize', this.onWindowResize);
+
+        canvas.addEventListener('pointerdown', this.onPointerDown);
+        canvas.addEventListener('pointerup', this.onPointerUp);
+
+        this.animate();
+    }
+
+    // ================================================================
+    // Private setup helpers
+    // ================================================================
+
+    private setupLights() {
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        this.scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        this.scene.add(dirLight);
+    }
+
+    private setupFloor() {
+        const floorGeo = new THREE.PlaneGeometry(20, 20);
+        const floorMat = new THREE.MeshStandardMaterial({
+            color: '#f0f0f0',
+            roughness: 0.8,
+            metalness: 0.1
+        });
+        this.floorMesh = new THREE.Mesh(floorGeo, floorMat);
+        this.floorMesh.rotation.x = -Math.PI / 2;
+        this.floorMesh.receiveShadow = true;
+        this.scene.add(this.floorMesh);
+
+        this.gridHelper = new THREE.GridHelper(20, 20, '#d0d0d0', '#e8e8e8');
+        this.gridHelper.position.y = 0.01;
+        this.scene.add(this.gridHelper);
+    }
+
+    // ================================================================
+    // Public model API
+    // ================================================================
+
+    /**
+     * Re-enforce the DEFAULT_HEIGHT Y-lock on a model.
+     * Call after any operation that may have mutated scale.y (design restore,
+     * scale-gizmo drag, applyTransform).
+     */
+    private _enforceYLock(model: THREE.Object3D) {
+        const locked = model.userData.defaultHeightScale as number | undefined;
+        if (locked !== undefined && locked > 0) {
+            model.scale.y = locked;
+        }
+    }
+
+    /**
+     * Load a GLB model. Returns true on success, false on failure.
+     * On failure the error is stored in loadErrors[id] — no exception is thrown,
+     * so one bad model cannot crash the whole scene.
+     *
+     * Scaling strategy — Reference Glass Table (DEFAULT_HEIGHT & GLASS_TABLE_WIDTH):
+     *   - Table-category models: Height (Y) scaled so bounding-box height matches DEFAULT_HEIGHT (0.90 m).
+     *   - Round tables specifically: Width/diameter (X/Z) also scaled so diameter matches GLASS_TABLE_WIDTH (1.11 m).
+     *   - Non-round tables: Width/depth remain at natural GLB proportions.
+     *   - Non-table models: Normalized using targetSize / DEFAULT_HEIGHT as appropriate.
+     *
+     * @param categoryKey      Category key for reference/ratio fallback.
+     * @param realHeightMeters Unused; kept for API compatibility.
+     * @param targetSize       Target size for non-table normalization.
+     * @param initialScale     Optional. XZ-only surface-relative multiplier applied to non-tables.
+     * @param category         Category name (e.g. "Tables", "Seating", "Decor").
+     */
+    public async loadModel(
+        id: string,
+        url: string,
+        position: THREE.Vector3,
+        categoryKey?: string,
+        realHeightMeters?: number,
+        targetSize?: number,
+        initialScale?: number,
+        category?: string
+    ): Promise<boolean> {
+        if (this.destroyed) return false;
+
+        // Already cached — just re-add to scene
+        if (this.loadedModels.has(id)) {
+            this.scene.add(this.loadedModels.get(id)!);
+            this.loadErrors.delete(id);
+            return true;
+        }
+
+        const cacheBustUrl = url.includes('?') ? url : `${url}?v=${Date.now()}`;
+
+        return new Promise<boolean>((resolve) => {
+            this.loader.load(
+                cacheBustUrl,
+                (gltf) => {
+                    if (this.destroyed) { resolve(false); return; }
+
+                    const model = gltf.scene;
+                    model.position.copy(position);
+                    model.userData.modelId = id;
+
+                    const rawBox = new THREE.Box3().setFromObject(model);
+                    const rawHeight = rawBox.max.y - rawBox.min.y;
+                    const currentHeight = rawHeight > 0 ? rawHeight : 1.0;
+
+                    if (isTable(id, category)) {
+                        // ── Table Scaling Rules ────────────────────────────────────
+                        // Step 1: Height Rule (All Tables)
+                        // Scale Y only so its height matches DEFAULT_HEIGHT (glass table reference, 0.90 m).
+                        const yScaleFactor = DEFAULT_HEIGHT / currentHeight;
+                        model.scale.y = yScaleFactor;
+                        model.userData.defaultHeightScale = yScaleFactor;
+
+                        // Step 2: Width Rule (Round Tables specifically)
+                        // Scale X and Z uniformly so horizontal diameter matches GLASS_TABLE_WIDTH (1.11 m).
+                        if (isRoundTable(id)) {
+                            const rawWidth = Math.max(rawBox.max.x - rawBox.min.x, rawBox.max.z - rawBox.min.z);
+                            const currentWidth = rawWidth > 0 ? rawWidth : 1.0;
+                            const widthScaleFactor = GLASS_TABLE_WIDTH / currentWidth;
+                            model.scale.x = widthScaleFactor;
+                            model.scale.z = widthScaleFactor;
+
+                            console.log(
+                                `[SceneManager] Round Table scaling applied to "${id}": ` +
+                                `rawH=${rawHeight.toFixed(3)}, yScale=${yScaleFactor.toFixed(4)} → height=${DEFAULT_HEIGHT} m; ` +
+                                `rawW=${rawWidth.toFixed(3)}, widthScale=${widthScaleFactor.toFixed(4)} → width=${GLASS_TABLE_WIDTH} m`
+                            );
+                        } else {
+                            // Non-round tables (glass table itself, rectangular tables, etc.):
+                            // Leave width/depth at natural GLB proportions.
+                            model.scale.x = 1.0;
+                            model.scale.z = 1.0;
+
+                            console.log(
+                                `[SceneManager] Table DEFAULT_HEIGHT lock applied to "${id}": ` +
+                                `rawH=${rawHeight.toFixed(3)}, yScale=${yScaleFactor.toFixed(4)} → height=${DEFAULT_HEIGHT} m; ` +
+                                `scaleX=1.0, scaleZ=1.0`
+                            );
+                        }
+                        model.userData.userRescaled = false;
+                    } else if (isScaledChair(id)) {
+                        // ── Chair Height & Width Scaling Rules (Flynn & Jelly Chairs) ───
+                        // Match both height and width to the reference Plastic Chair on load:
+                        // yScaleFactor = CHAIR_DEFAULT_HEIGHT / currentHeight
+                        // xzScaleFactor = CHAIR_DEFAULT_WIDTH / currentWidth
+                        const currentWidth = (rawBox.max.x - rawBox.min.x) || 1.0;
+                        const yScaleFactor = CHAIR_DEFAULT_HEIGHT / currentHeight;
+                        const xzScaleFactor = CHAIR_DEFAULT_WIDTH / currentWidth;
+
+                        model.scale.y = yScaleFactor;
+                        model.scale.x = xzScaleFactor;
+                        model.scale.z = xzScaleFactor;
+                        model.userData.defaultHeightScale = yScaleFactor;
+                        model.userData.userRescaled = false;
+
+                        console.log(
+                            `[SceneManager] Chair reference scaling applied to "${id}": ` +
+                            `rawH=${currentHeight.toFixed(3)}, yScale=${yScaleFactor.toFixed(5)} → height=${CHAIR_DEFAULT_HEIGHT} m; ` +
+                            `rawW=${currentWidth.toFixed(3)}, xzScale=${xzScaleFactor.toFixed(5)} → width=${CHAIR_DEFAULT_WIDTH} m`
+                        );
+                    } else if (isReferenceChair(id)) {
+                        // Plastic chair is the reference model — skip rescaling (scale = 1.0)
+                        model.scale.set(1.0, 1.0, 1.0);
+                        model.userData.defaultHeightScale = 1.0;
+                        model.userData.userRescaled = false;
+
+                        console.log(`[SceneManager] Reference Plastic Chair loaded with natural scale=1.0`);
+                    } else {
+                        // ── Other non-table models (Other Seating, Decor) ──────────
+                        if (targetSize !== undefined) {
+                            const rawSize = new THREE.Vector3();
+                            rawBox.getSize(rawSize);
+                            const maxDim = Math.max(rawSize.x, rawSize.y, rawSize.z);
+                            if (maxDim > 0) {
+                                const scaleFactor = targetSize / maxDim;
+                                model.scale.setScalar(scaleFactor);
+                                model.userData.defaultHeightScale = scaleFactor;
+                            }
+                        } else {
+                            const yScaleFactor = DEFAULT_HEIGHT / currentHeight;
+                            model.scale.set(1, yScaleFactor, 1);
+                            model.userData.defaultHeightScale = yScaleFactor;
+                        }
+                        model.userData.userRescaled = false;
+
+                        // Apply surface-relative initial scale (X/Z only) if provided
+                        if (initialScale !== undefined && initialScale !== 1) {
+                            model.scale.x *= initialScale;
+                            model.scale.z *= initialScale;
+                            console.log(`[SceneManager] XZ auto-scale applied to "${id}": ×${initialScale.toFixed(3)} → scaleXZ=${model.scale.x.toFixed(3)}`);
+                        }
+                    }
+
+                    // ── Cache baseline scales and physical dimensions ────────
+                    model.userData.defaultWidthScale = model.scale.x;
+                    model.userData.defaultDepthScale = model.scale.z;
+                    if (model.userData.defaultHeightScale === undefined) {
+                        model.userData.defaultHeightScale = model.scale.y;
+                    }
+
+                    const normBox  = new THREE.Box3().setFromObject(model);
+                    const normSize = new THREE.Vector3();
+                    normBox.getSize(normSize);
+                    model.userData.defaultPhysicalWidth = normSize.x;
+                    model.userData.defaultPhysicalHeight = normSize.y;
+                    model.userData.defaultPhysicalDepth = normSize.z;
+
+                    // ── Cache footprint at post-normalisation scale ───────────
+                    if (!this.modelFootprints.has(id)) {
+                        const footprint = Math.max(normSize.x, normSize.z);
+                        this.modelFootprints.set(id, footprint > 0 ? footprint : 1);
+                        console.log(`[SceneManager] Footprint cached for "${id}": ${footprint.toFixed(3)} m`);
+                    }
+
+                    // Seat the model on y = 0 (using post-scale bbox)
+                    const box = new THREE.Box3().setFromObject(model);
+                    model.position.y -= box.min.y;
+
+                    model.traverse((child) => {
+                        if (child instanceof THREE.Mesh) {
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                        }
+                    });
+
+                    // Snapshot original materials for colour-reset.
+                    // We clone here so the snapshot is never mutated by later colour changes.
+                    const materialsMap = new Map<THREE.Mesh, THREE.Material>();
+                    model.traverse((child) => {
+                        if (child instanceof THREE.Mesh) {
+                            materialsMap.set(child, child.material.clone());
+                        }
+                    });
+                    this.originalMaterials.set(id, materialsMap);
+
+                    this.loadedModels.set(id, model);
+                    this.scene.add(model);
+                    this.loadErrors.delete(id);
+                    resolve(true);
+                },
+                undefined,
+                (error) => {
+                    // Per-model error: log it, store it, resolve false — don't crash the scene
+                    const msg = error instanceof Error ? error.message : String(error);
+                    console.error(`[SceneManager] Failed to load model "${id}" (${url}): ${msg}`);
+                    this.loadedModels.delete(id);
+                    this.originalMaterials.delete(id);
+                    this.loadErrors.set(id, msg);
+                    resolve(false);
+                }
+            );
+        });
+    }
+
+    /**
+     * Lightweight removal — keeps the object alive in loadedModels so
+     * re-checking the sidebar checkbox re-adds it cheaply without a new GLB fetch.
+     * Used by the sidebar checkbox toggle path only.
+     */
+    public removeModel(id: string) {
+        if (this.loadedModels.has(id)) {
+            const model = this.loadedModels.get(id)!;
+            if (this.selectedObjectId === id) {
+                this.selectObject(null);
+            }
+            this.scene.remove(model);
+        }
+    }
+
+    /**
+     * Duplicate an existing model instance into a fully independent copy.
+     *
+     * Material cloning is the critical step: THREE.Object3D.clone() with
+     * recursive=true shares geometry references (fine, read-only) but ALSO
+     * shares material references (bad — color changes would bleed across
+     * instances). We fix this by re-traversing every Mesh in the clone and
+     * assigning child.material = child.material.clone() immediately after
+     * cloning, before the clone is added to the scene or the registry.
+     *
+     * Returns the new instance ID on success, null if the source doesn't exist.
+     */
+    public duplicateModel(sourceId: string, newId: string): string | null {
+        const source = this.loadedModels.get(sourceId);
+        if (!source) return null;
+
+        // Deep-clone the Object3D hierarchy (geometry is shared — read-only, safe).
+        const clone = source.clone(true);
+
+        // ── Per-instance material isolation ──────────────────────────────
+        // After Object3D.clone(), every Mesh in the clone still references the
+        // SAME material instances as the source. We must clone each material
+        // individually so colour/property changes on one instance never affect
+        // the other.
+        const clonedMaterialsMap = new Map<THREE.Mesh, THREE.Material>();
+        clone.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                // Clone the material — this creates a completely new material
+                // object with the same properties but a different identity.
+                child.material = child.material.clone();
+
+                // Snapshot the freshly-cloned material as the "original" for
+                // this instance so that colour-reset (null) works correctly.
+                clonedMaterialsMap.set(child, child.material.clone());
+            }
+        });
+        this.originalMaterials.set(newId, clonedMaterialsMap);
+
+        // Offset slightly on X so the duplicate is immediately visible and
+        // not hidden directly underneath the original.
+        clone.position.x += 0.7;
+
+        // Tag with its own unique ID and carry over the Y-lock value.
+        // The clone already has scale.y = source.scale.y (from Object3D.clone),
+        // so the height is already correct — we just need to keep the stored value.
+        clone.userData = {
+            ...source.userData,
+            modelId: newId,
+            userRescaled: source.userData.userRescaled ?? false,
+            defaultHeightScale: source.userData.defaultHeightScale,
+            defaultWidthScale: source.userData.defaultWidthScale,
+            defaultDepthScale: source.userData.defaultDepthScale,
+            defaultPhysicalWidth: source.userData.defaultPhysicalWidth,
+            defaultPhysicalHeight: source.userData.defaultPhysicalHeight,
+            defaultPhysicalDepth: source.userData.defaultPhysicalDepth
+        };
+
+        // Re-enforce Y-lock on the clone (guards against any userData drift)
+        this._enforceYLock(clone);
+
+        this.loadedModels.set(newId, clone);
+        this.scene.add(clone);
+
+        return newId;
+    }
+
+    /**
+     * Fully remove a model from the scene and dispose all GPU resources.
+     *
+     * Unlike removeModel() (which keeps the object alive for cheap re-add),
+     * this is irreversible. Call it from the "Delete" button path.
+     *
+     * Disposal order:
+     *   1. Detach TransformControls so the gizmo doesn't reference a dead object.
+     *   2. Remove from scene graph.
+     *   3. Traverse meshes → dispose geometry, dispose material(s), dispose
+     *      any textures hanging off the material maps (map, normalMap, etc.)
+     *      to release WebGL memory.
+     *   4. Remove from internal registries.
+     */
+    public deleteModel(id: string) {
+        const model = this.loadedModels.get(id);
+        if (!model) return;
+
+        // 1. Detach TransformControls first — must happen before scene.remove()
+        //    so the gizmo update loop doesn't try to read a removed object.
+        if (this.selectedObjectId === id) {
+            this.transformControl.detach();
+            this.selectedObjectId = null;
+            if (this.onObjectSelected) this.onObjectSelected(null);
+        }
+
+        // 2. Remove from Three.js scene graph.
+        this.scene.remove(model);
+
+        // 3. Dispose GPU resources to prevent memory leaks.
+        model.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                // Dispose geometry buffers (VBOs/IBOs on the GPU).
+                if (child.geometry) {
+                    child.geometry.dispose();
+                }
+
+                // Material can be a single instance or an array (multi-material mesh).
+                const materials = Array.isArray(child.material)
+                    ? child.material
+                    : [child.material];
+
+                for (const mat of materials) {
+                    // Dispose each texture map attached to the material
+                    // to release the corresponding WebGL texture object.
+                    const textureMaps: (keyof THREE.MeshStandardMaterial)[] = [
+                        'map', 'normalMap', 'roughnessMap', 'metalnessMap',
+                        'aoMap', 'emissiveMap', 'bumpMap', 'displacementMap',
+                        'envMap', 'lightMap', 'alphaMap'
+                    ];
+                    for (const key of textureMaps) {
+                        const tex = (mat as any)[key] as THREE.Texture | undefined;
+                        if (tex && typeof tex.dispose === 'function') {
+                            tex.dispose();
+                        }
+                    }
+                    mat.dispose();
+                }
+            }
+        });
+
+        // 4. Remove from internal registries.
+        this.loadedModels.delete(id);
+        this.originalMaterials.delete(id);
+
+        if (this.loadedModels.size === 0) {
+            console.log('[SceneManager] All models removed from scene.');
+        }
+    }
+
+    /**
+     * No-op kept for API compatibility during transition.
+     * The DEFAULT_HEIGHT system needs no per-session reference state to reset.
+     * @deprecated Safe to remove once all callers are updated.
+     */
+    public resetReference() {
+        // No-op: DEFAULT_HEIGHT lock requires no session state
+    }
+
+    /**
+     * Returns the IDs of every model currently registered in the scene
+     * (originals + duplicates). Used by the Svelte layer for "color all".
+     */
+    public getAllModelIds(): string[] {
+        return Array.from(this.loadedModels.keys());
+    }
+
+    /**
+     * Returns the world-space bounding box of a loaded model, or null if
+     * the model is not currently registered.
+     *
+     * Used by the Svelte layer to measure an existing model's top-surface
+     * footprint for object-on-object placement: the caller takes min(x, z)
+     * of the returned box size as the "surface size" for the new model.
+     */
+    public getModelBoundingBox(id: string): THREE.Box3 | null {
+        const model = this.loadedModels.get(id);
+        if (!model) return null;
+        return new THREE.Box3().setFromObject(model);
+    }
+
+    /**
+     * Compute the initial scale factor for a newly placed model so its footprint
+     * fills `targetFillRatio` of the given surface size, clamped to [minScale, maxScale].
+     *
+     * Call this BEFORE loadModel() — pass the returned value as initialScale.
+     *
+     * @param modelId        The model ID (used to look up the cached footprint).
+     * @param surfaceSize    The surface's smaller dimension in Three.js metres.
+     *                       For floor placement use FLOOR_SURFACE_SIZE_M;
+     *                       for object-on-object use min(bbox.x, bbox.z) of the target.
+     * @param config         AutoScaleConfig from the DecorModel definition.
+     * @param targetSize     The targetSize used for normalisation (same as loadModel's).
+     *                       Required to estimate footprint before first load; after the
+     *                       first load the cached footprint is used instead.
+     * @returns              The scale multiplier to pass to loadModel as initialScale.
+     *
+     * NOTE — footprint estimation before first load:
+     *   On the very first placement the model hasn't been loaded yet, so the real
+     *   footprint isn't in the cache. We estimate it from targetSize:
+     *   • For Tables (no targetSize) we estimate 1.0 m as a conservative default.
+     *   • For Seating / Decor the post-normalised footprint ≈ targetSize × 0.6
+     *     (most furniture models are taller than they are wide; 0.6 is a good heuristic).
+     *   On subsequent placements of the same model the cached real footprint is used.
+     */
+    public computeAutoScale(
+        modelId: string,
+        surfaceSize: number,
+        config: { targetFillRatio: number; minScale: number; maxScale: number },
+        targetSize?: number
+    ): number {
+        // Use cached footprint if available, otherwise estimate.
+        let footprint = this.modelFootprints.get(modelId);
+        if (!footprint) {
+            if (targetSize !== undefined) {
+                // Heuristic: most models are taller than wide; footprint ≈ 60% of targetSize.
+                footprint = targetSize * 0.6;
+            } else {
+                // Tables have no targetSize — assume 1 m as a safe conservative estimate.
+                footprint = 1.0;
+            }
+            console.log(`[SceneManager] computeAutoScale: footprint estimated for "${modelId}": ${footprint.toFixed(3)} m (cache miss)`);
+        }
+
+        if (footprint <= 0) {
+            console.warn(`[SceneManager] computeAutoScale: zero footprint for "${modelId}", returning 1.0`);
+            return 1.0;
+        }
+
+        const targetDim  = surfaceSize * config.targetFillRatio;
+        const rawScale   = targetDim / footprint;
+        const clamped    = Math.max(config.minScale, Math.min(config.maxScale, rawScale));
+
+        console.log(
+            `[SceneManager] computeAutoScale "${modelId}": surface=${surfaceSize.toFixed(2)}, ` +
+            `footprint=${footprint.toFixed(3)}, ratio=${config.targetFillRatio}, ` +
+            `raw=${rawScale.toFixed(3)}, clamped=${clamped.toFixed(3)}`
+        );
+
+        return clamped;
+    }
+
+    /**
+     * Returns a snapshot of the current transforms (position, rotation, scale)
+     * for all loaded models.
+     */
+    public getModelTransforms(): Map<string, { position: THREE.Vector3; rotation: THREE.Euler; scale: THREE.Vector3 }> {
+        const transforms = new Map<string, { position: THREE.Vector3; rotation: THREE.Euler; scale: THREE.Vector3 }>();
+        for (const [id, model] of this.loadedModels.entries()) {
+            transforms.set(id, {
+                position: model.position.clone(),
+                rotation: model.rotation.clone(),
+                scale: model.scale.clone()
+            });
+        }
+        return transforms;
+    }
+
+    /**
+     * Applies a specific transform to a model.
+     *
+     * When restoring a saved design (isUserAction=false) the stored Y-scale is
+     * ignored and the DEFAULT_HEIGHT lock is re-enforced, so saved designs
+     * never break the height invariant even if they were saved under the old
+     * ratio-based system.
+     *
+     * User-initiated transforms (isUserAction=true, e.g. the properties panel)
+     * supply XZ scale only via applyXZScale() — this path preserves userRescaled.
+     */
+    public applyTransform(id: string, position: [number, number, number], rotation: [number, number, number], scale?: [number, number, number], isUserAction: boolean = true) {
+        const model = this.loadedModels.get(id);
+        if (!model) return;
+        model.position.set(position[0], position[1], position[2]);
+        model.rotation.set(rotation[0], rotation[1], rotation[2]);
+        if (!isUserAction && scale) {
+            model.scale.set(scale[0], scale[1], scale[2]);
+        }
+        // Always re-enforce the height lock regardless of who called this.
+        // Design restores pass the saved scale.y which may differ; we ignore it.
+        this._enforceYLock(model);
+    }
+
+    /**
+     * Apply a uniform XZ scale multiplier to a model while keeping Y locked at DEFAULT_HEIGHT.
+     *
+     * multiplierOrScale is treated as a relative factor to the model's placed default baseline
+     * (1.0 = baseline placed size, 1.2 = +20%, etc.).
+     *
+     * @param id                 The model instance ID.
+     * @param multiplierOrScale  The desired scale factor relative to default (1.0 = default size).
+     */
+    public applyXZScale(id: string, multiplierOrScale: number) {
+        const model = this.loadedModels.get(id);
+        if (!model) return;
+        const baseW = (model.userData.defaultWidthScale as number) || 1.0;
+        const baseZ = (model.userData.defaultDepthScale as number) || baseW;
+        model.scale.x = baseW * multiplierOrScale;
+        model.scale.z = baseZ * multiplierOrScale;
+        // Re-enforce Y lock in case something mutated it externally
+        this._enforceYLock(model);
+        model.userData.userRescaled = true;
+    }
+
+    /**
+     * Returns the current horizontal scale multiplier relative to the model's placed default (1.0 = default).
+     */
+    public getModelScaleMultiplier(id: string): number {
+        const model = this.loadedModels.get(id);
+        if (!model) return 1.0;
+        const baseW = model.userData.defaultWidthScale as number | undefined;
+        if (baseW && baseW > 0) {
+            return model.scale.x / baseW;
+        }
+        return model.scale.x;
+    }
+
+    /**
+     * Returns the physical bounding box dimensions (in meters) of a loaded model.
+     */
+    public getModelPhysicalSize(id: string): { width: number; height: number; depth: number } {
+        const model = this.loadedModels.get(id);
+        if (!model) return { width: 0, height: 0, depth: 0 };
+        const box = new THREE.Box3().setFromObject(model);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        return {
+            width: Number(size.x.toFixed(2)),
+            height: Number(size.y.toFixed(2)),
+            depth: Number(size.z.toFixed(2))
+        };
+    }
+
+    /**
+     * Sets the physical width (in meters) of a loaded model, scaling width and depth proportionally.
+     */
+    public setModelPhysicalWidth(id: string, widthMeters: number) {
+        const model = this.loadedModels.get(id);
+        if (!model || widthMeters <= 0) return;
+        const defaultPhysW = (model.userData.defaultPhysicalWidth as number) || 1.0;
+        const multiplier = widthMeters / defaultPhysW;
+        this.applyXZScale(id, multiplier);
+    }
+
+    public setModelColor(id: string, hexColor: string | null) {
+        const model = this.loadedModels.get(id);
+        const originalMats = this.originalMaterials.get(id);
+
+        if (!model || !originalMats) return;
+
+        model.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                if (hexColor === null) {
+                    // Restore original material (clone so future resets work too)
+                    const original = originalMats.get(child);
+                    if (original) {
+                        child.material = original.clone();
+                    }
+                } else {
+                    // Override colour — clone first to avoid mutating cached material
+                    if (!(child.material instanceof THREE.MeshStandardMaterial)) {
+                        child.material = new THREE.MeshStandardMaterial({ color: hexColor });
+                    } else {
+                        child.material = child.material.clone();
+                        (child.material as THREE.MeshStandardMaterial).color.set(hexColor);
+                    }
+                }
+            }
+        });
+    }
+
+    // ================================================================
+    // Environment / Panorama API
+    // ================================================================
+
+    /**
+     * Loads an HDR equirectangular panorama and sets it as the scene background and environment.
+     * Pass null to restore the default 3D room.
+     */
+    public async setEnvironment(url: string | null): Promise<boolean> {
+        if (this.destroyed) return false;
+
+        if (url === null) {
+            if (this.currentEnvTexture) {
+                this.currentEnvTexture.dispose();
+                this.currentEnvTexture = null;
+            }
+            this.scene.background = this.defaultBackground;
+            this.scene.environment = null;
+            this.renderer.toneMappingExposure = 1.0;
+            return true;
+        }
+
+        return new Promise<boolean>((resolve) => {
+            const rgbeLoader = new RGBELoader();
+            rgbeLoader.load(
+                url,
+                (texture) => {
+                    if (this.destroyed) {
+                        texture.dispose();
+                        resolve(false);
+                        return;
+                    }
+
+                    if (this.currentEnvTexture) {
+                        this.currentEnvTexture.dispose();
+                    }
+
+                    texture.mapping = THREE.EquirectangularReflectionMapping;
+                    this.scene.background = texture;
+                    this.scene.environment = texture;
+                    this.currentEnvTexture = texture;
+                    
+                    this.renderer.toneMappingExposure = 1.0;
+                    
+                    resolve(true);
+                },
+                undefined,
+                (error) => {
+                    const msg = error instanceof Error ? error.message : String(error);
+                    console.error(`[SceneManager] Failed to load HDR environment from ${url}: ${msg}`);
+                    // Revert to default background on failure
+                    if (this.currentEnvTexture) {
+                        this.currentEnvTexture.dispose();
+                        this.currentEnvTexture = null;
+                    }
+                    this.scene.background = this.defaultBackground;
+                    this.scene.environment = null;
+                    resolve(false);
+                }
+            );
+        });
+    }
+
+    // Background and Capture
+    // ================================================================
+
+    /**
+     * Set (or clear) the environment background image.
+     *
+     * ARCHITECTURE NOTE — Why we no longer use scene.background:
+     * ───────────────────────────────────────────────────────────
+     * scene.background maps a texture onto a skybox sphere and samples it based
+     * on the PerspectiveCamera's viewing direction. Because the camera is tilted
+     * downward (position (0,3,6) looking at (0,1,0)), the image only appears in
+     * the upper viewport half; the lower half shows the 3D floor/grid.
+     *
+     * The fix: dual-render architecture.
+     *   1. bgScene + bgCamera (OrthographicCamera) renders a fullscreen quad
+     *      textured with the JPEG. The quad always fills 100% of the viewport,
+     *      regardless of perspective camera angle or orbit position.
+     *   2. The main 3D scene is rendered on top with autoClear = false.
+     */
+    public setBackgroundImage(dataUrl: string | null, mode: 'contain' | 'cover' | 'stretch' | 'original' = 'cover') {
+        this.bgMode = mode;
+
+        if (!dataUrl) {
+            // ── Remove environment image → restore default grey state ─────
+            this._destroyBgMesh();
+            if (this.bgTexture) {
+                this.bgTexture.dispose();
+                this.bgTexture = null;
+            }
+            this.hasEnvImage = false;
+            // Restore solid-colour background on main scene
+            this.scene.background = new THREE.Color('#e0e0e5');
+            // Restore floor and grid visibility
+            if (this.floorMesh)  this.floorMesh.visible  = true;
+            if (this.gridHelper) this.gridHelper.visible = true;
+            return;
+        }
+
+        new THREE.TextureLoader().load(dataUrl, (texture) => {
+            if (this.destroyed) { texture.dispose(); return; }
+
+            // Dispose previous texture
+            if (this.bgTexture) this.bgTexture.dispose();
+
+            texture.colorSpace    = THREE.SRGBColorSpace;
+            // No mipmaps needed — we control UV scaling ourselves
+            texture.generateMipmaps = false;
+            texture.minFilter     = THREE.LinearFilter;
+            texture.magFilter     = THREE.LinearFilter;
+            texture.wrapS         = THREE.ClampToEdgeWrapping;
+            texture.wrapT         = THREE.ClampToEdgeWrapping;
+            // We will set the matrix manually in _updateBgUVTransform
+            texture.matrixAutoUpdate = false;
+
+            this.bgTexture   = texture;
+            const imgEl      = texture.image as { width: number; height: number };
+            this.imageAspect = imgEl.width / imgEl.height;
+            this.hasEnvImage = true;
+
+            // Clear the solid scene.background so the bg quad shows through
+            this.scene.background = null;
+
+            // Hide the grey floor and grid — they would obscure the photo
+            if (this.floorMesh)  this.floorMesh.visible  = false;
+            if (this.gridHelper) this.gridHelper.visible = false;
+
+            // Build (or rebuild) the fullscreen background mesh
+            this._createBgMesh(texture);
+            this._updateBgUVTransform();
+        });
+    }
+
+    /** Create the fullscreen quad in bgScene. Removes any previous mesh first. */
+    private _createBgMesh(texture: THREE.Texture) {
+        this._destroyBgMesh();
+
+        // PlaneGeometry(2, 2) fills the ortho camera's NDC range [-1..1] exactly.
+        const geo = new THREE.PlaneGeometry(2, 2);
+        const mat = new THREE.MeshBasicMaterial({
+            map:        texture,
+            depthTest:  false,
+            depthWrite: false
+        });
+        this.bgMesh = new THREE.Mesh(geo, mat);
+        this.bgMesh.renderOrder = -1;
+        this.bgScene.add(this.bgMesh);
+    }
+
+    /** Remove the background mesh and dispose its geometry + material (NOT the texture). */
+    private _destroyBgMesh() {
+        if (!this.bgMesh) return;
+        this.bgScene.remove(this.bgMesh);
+        this.bgMesh.geometry.dispose();
+        (this.bgMesh.material as THREE.Material).dispose();
+        this.bgMesh = null;
+    }
+
+    /**
+     * Recalculate the texture UV transform so the image fills the viewport
+     * according to bgMode (cover / contain / stretch / original).
+     *
+     * This is pure 2D screen-space math. It is completely unaffected by the
+     * PerspectiveCamera's FOV, position, rotation, or OrbitControls state.
+     */
+    private _updateBgUVTransform() {
+        if (!this.bgTexture || !this.bgMesh) return;
+
+        const canvas       = this.renderer.domElement;
+        const canvasAspect = canvas.clientWidth / canvas.clientHeight;
+
+        let scaleX = 1;
+        let scaleY = 1;
+
+        switch (this.bgMode) {
+            case 'cover':
+                // Fill the viewport completely — crop excess to preserve aspect ratio.
+                if (canvasAspect > this.imageAspect) {
+                    // Viewport wider than image → fit width, crop top/bottom
+                    scaleX = 1;
+                    scaleY = this.imageAspect / canvasAspect;
+                } else {
+                    // Viewport taller than image → fit height, crop left/right
+                    scaleX = canvasAspect / this.imageAspect;
+                    scaleY = 1;
+                }
+                break;
+
+            case 'contain':
+                // Show entire image — allow letterbox/pillarbox bars.
+                if (canvasAspect > this.imageAspect) {
+                    // Viewport wider → bars on left/right
+                    scaleX = canvasAspect / this.imageAspect;
+                    scaleY = 1;
+                } else {
+                    // Viewport taller → bars on top/bottom
+                    scaleX = 1;
+                    scaleY = this.imageAspect / canvasAspect;
+                }
+                break;
+
+            case 'stretch':
+                // Stretch to fill exactly — no aspect ratio preservation.
+                scaleX = 1;
+                scaleY = 1;
+                break;
+
+            case 'original': {
+                // 1:1 pixel mapping, centred.
+                const img = this.bgTexture.image as { width: number; height: number };
+                const imgW = img.width;
+                const imgH = img.height;
+                scaleX = canvas.clientWidth  / imgW;
+                scaleY = canvas.clientHeight / imgH;
+                break;
+            }
+        }
+
+        // setUvTransform(tx, ty, sx, sy, rotation, pivotX, pivotY)
+        // Pivot at (0.5, 0.5) keeps the image centred in all modes.
+        this.bgTexture.matrix.setUvTransform(0, 0, scaleX, scaleY, 0, 0.5, 0.5);
+        this.bgTexture.needsUpdate = true;
+    }
+
+    /**
+     * Capture the scene as a PNG data URL.
+     * Renders both passes (background quad + 3D) in the correct order so the
+     * captured image contains the full composition.
+     */
+    public captureScene(): string {
+        if (this.hasEnvImage) {
+            // Pass 1 — background quad
+            this.renderer.autoClear = true;
+            this.renderer.clear();
+            this.renderer.render(this.bgScene, this.bgCamera);
+            // Pass 2 — 3D scene on top
+            this.renderer.autoClear = false;
+            this.renderer.render(this.scene, this.camera);
+        } else {
+            this.renderer.autoClear = true;
+            this.renderer.render(this.scene, this.camera);
+        }
+        return this.renderer.domElement.toDataURL('image/png');
+    }
+    // ================================================================
+    // Pointer / selection
+    // ================================================================
+
+    private onPointerDown = (event: PointerEvent) => {
+        this.clickStart.set(event.clientX, event.clientY);
+    }
+
+    private onPointerUp = (event: PointerEvent) => {
+        // Treat as drag if pointer moved > 3 px — don't change selection
+        if (Math.abs(event.clientX - this.clickStart.x) > 3 ||
+            Math.abs(event.clientY - this.clickStart.y) > 3) {
+            return;
+        }
+
+        // Ignore while the gizmo is actively dragging
+        if (this.transformControl.dragging) return;
+
+        const canvas = this.renderer.domElement;
+        const rect = canvas.getBoundingClientRect();
+
+        this.mouse.x =  ((event.clientX - rect.left) / canvas.clientWidth)  * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top)  / canvas.clientHeight) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // Only raycast against loaded 3D models.
+        // bgMesh lives in bgScene (not this.scene) so it is never in this list
+        // and can never intercept pointer events intended for 3D models.
+        const interactableObjects = Array.from(this.loadedModels.values());
+        const intersects = this.raycaster.intersectObjects(interactableObjects, true);
+
+        if (intersects.length > 0) {
+            let object: THREE.Object3D | null = intersects[0].object;
+            let foundId: string | null = null;
+
+            while (object) {
+                if (object.userData?.modelId) {
+                    foundId = object.userData.modelId;
+                    break;
+                }
+                object = object.parent;
+            }
+
+            this.selectObject(foundId);
+        } else {
+            // Don't deselect if the click was on the TransformControls gizmo.
+            // Use transformControlHelper (the Object3D returned by getHelper()).
+            const transformIntersects = this.raycaster.intersectObject(
+                this.transformControlHelper, true
+            );
+            if (transformIntersects.length === 0) {
+                this.selectObject(null);
+            }
+        }
+    }
+
+    public selectObject(id: string | null) {
+        if (this.selectedObjectId === id) return;
+
+        this.selectedObjectId = id;
+        if (id && this.loadedModels.has(id)) {
+            // Rebind TransformControls to whichever object (original or duplicate)
+            // is now selected. This is the key step that makes per-instance
+            // transforms work: we always attach to the live Object3D reference
+            // stored in loadedModels, not a stale reference from before cloning.
+            this.transformControl.attach(this.loadedModels.get(id)!);
+        } else {
+            this.transformControl.detach();
+        }
+
+        if (this.onObjectSelected) {
+            this.onObjectSelected(id);
+        }
+    }
+
+    public setTransformMode(mode: 'translate' | 'rotate') {
+        if (mode !== 'translate' && mode !== 'rotate') return;
+        this.transformControl.setMode(mode);
+        (this.transformControl as any).showY = true;
+    }
+
+    public getSelectedObjectId() {
+        return this.selectedObjectId;
+    }
+
+    // ================================================================
+    // Resize
+    // ================================================================
+
+    private onWindowResize = () => {
+        if (this.destroyed) return;
+        const canvas = this.renderer.domElement;
+        if (!canvas.parentElement) return;
+        const width  = canvas.parentElement.clientWidth;
+        const height = canvas.parentElement.clientHeight;
+        if (width === 0 || height === 0) return; // guard: don't set a 0×0 viewport
+
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(width, height);
+
+        // Recalculate UV scaling for the new viewport dimensions
+        this._updateBgUVTransform();
+    }
+
+    /** Call this after entering/exiting fullscreen to recalculate canvas size. */
+    public triggerResize() {
+        setTimeout(this.onWindowResize, 50);
+    }
+
+    // ================================================================
+    // Render loop
+    // ================================================================
+
+    private animate = () => {
+        if (this.destroyed) return;
+        this.animationId = requestAnimationFrame(this.animate);
+        this.controls.update();
+
+        if (this.hasEnvImage) {
+            // ── Two-pass render ─────────────────────────────────────────────
+            // Pass 1: draw the fullscreen background quad (clears framebuffer).
+            this.renderer.autoClear = true;
+            this.renderer.render(this.bgScene, this.bgCamera);
+            // Pass 2: draw 3D scene on top WITHOUT clearing.
+            this.renderer.autoClear = false;
+            this.renderer.render(this.scene, this.camera);
+        } else {
+            // ── Single-pass render (default grey background via scene.background)
+            this.renderer.autoClear = true;
+            this.renderer.render(this.scene, this.camera);
+        }
+    }
+
+    // ================================================================
+    // Cleanup — ALWAYS call in onDestroy to prevent duplicate-renderer
+    // crashes on Vite HMR re-mount or SvelteKit re-navigation.
+    // ================================================================
+
+    public destroy() {
+        if (this.destroyed) return; // idempotent
+        this.destroyed = true;
+
+        cancelAnimationFrame(this.animationId);
+
+        window.removeEventListener('resize', this.onWindowResize);
+        const canvas = this.renderer.domElement;
+        canvas.removeEventListener('pointerdown', this.onPointerDown);
+        canvas.removeEventListener('pointerup', this.onPointerUp);
+
+        // Dispose background resources
+        this._destroyBgMesh();
+        if (this.bgTexture) {
+            this.bgTexture.dispose();
+            this.bgTexture = null;
+        }
+
+        this.transformControl.detach();
+        this.transformControl.disconnect();
+        this.transformControl.dispose();
+        this.controls.dispose();
+        this.renderer.dispose();
+    }
+}
